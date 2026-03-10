@@ -1,0 +1,15 @@
+[project]
+name = "bq-explorer"
+version = "0.1.0"
+description = "Streamlit app for exploring BigQuery datasets, tables, and views"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "google-cloud-bigquery>=3.40.1",
+    "google-cloud-bigquery-storage>=2.36.2",
+    "google-cloud-logging>=3.11.0",
+    "db-dtypes>=1.5.0",
+    "pandas>=2.3.3",
+    "pyarrow>=19.0.0",
+    "streamlit>=1.45.0",
+]

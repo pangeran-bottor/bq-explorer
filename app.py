@@ -204,52 +204,19 @@ def fetch_tables(client: bigquery.Client, region: str) -> pd.DataFrame:
     return df
 
 
-def count_view_rows(client: bigquery.Client, project: str, df_tables: pd.DataFrame) -> pd.DataFrame:
-    """Run SELECT COUNT(*) for each view and update row_count in-place."""
-    views = df_tables[df_tables.table_type == "VIEW"]
-    if views.empty:
-        log.info("No views to count rows for")
-        return df_tables
-    view_names = [f"{r['dataset_id']}.{r['table_name']}" for _, r in views.iterrows()]
-    log.info("Counting rows for %d views: %s", len(views), ", ".join(view_names))
+def count_single_view_rows(client: bigquery.Client, project: str, dataset_id: str, table_name: str) -> int | None:
+    """Run SELECT COUNT(*) for a single view. Returns row count or None on failure."""
+    fqn = f"`{project}.{dataset_id}.{table_name}`"
+    log.info("Counting rows for view %s.%s", dataset_id, table_name)
     t0 = time.time()
-
-    # Build a single UNION ALL query to count all views at once
-    parts = []
-    for _, row in views.iterrows():
-        fqn = f"`{project}.{row['dataset_id']}.{row['table_name']}`"
-        parts.append(
-            f"SELECT '{row['dataset_id']}' AS dataset_id, "
-            f"'{row['table_name']}' AS table_name, "
-            f"COUNT(*) AS cnt FROM {fqn}"
-        )
-
-    sql = " UNION ALL ".join(parts)
     try:
-        df_counts = client.query(sql).to_dataframe()
+        result = client.query(f"SELECT COUNT(*) AS cnt FROM {fqn}").to_dataframe()
+        cnt = int(result["cnt"].iloc[0])
+        log.info("View %s.%s has %d rows (%.1fs)", dataset_id, table_name, cnt, time.time() - t0)
+        return cnt
     except Exception:
-        log.warning("Combined view-count query failed, falling back to per-view queries")
-        # If the combined query fails, fall back to per-view queries
-        counts = {}
-        for _, row in views.iterrows():
-            fqn = f"`{project}.{row['dataset_id']}.{row['table_name']}`"
-            try:
-                result = client.query(f"SELECT COUNT(*) AS cnt FROM {fqn}").to_dataframe()
-                counts[(row["dataset_id"], row["table_name"])] = result["cnt"].iloc[0]
-            except Exception:
-                log.warning("Failed to count rows for %s.%s", row["dataset_id"], row["table_name"])
-        for (ds, tbl), cnt in counts.items():
-            mask = (df_tables.dataset_id == ds) & (df_tables.table_name == tbl)
-            df_tables.loc[mask, "row_count"] = cnt
-        log.info("View row counts done (fallback) in %.1fs", time.time() - t0)
-        return df_tables
-
-    for _, cr in df_counts.iterrows():
-        mask = (df_tables.dataset_id == cr["dataset_id"]) & (df_tables.table_name == cr["table_name"])
-        df_tables.loc[mask, "row_count"] = cr["cnt"]
-
-    log.info("View row counts done in %.1fs", time.time() - t0)
-    return df_tables
+        log.warning("Failed to count rows for %s.%s", dataset_id, table_name, exc_info=True)
+        return None
 
 
 # ── Local cache ──────────────────────────────────────────────────
@@ -451,6 +418,16 @@ if force_refresh:
 
     st.sidebar.caption("Fetched live & cached just now")
 
+# ── Clear view row counts & apply on-demand counts ───────────────
+df_tables.loc[df_tables.table_type == "VIEW", "row_count"] = pd.NA
+
+if "view_row_counts" not in st.session_state:
+    st.session_state["view_row_counts"] = {}
+
+for (ds, tbl), cnt in st.session_state["view_row_counts"].items():
+    mask = (df_tables.dataset_id == ds) & (df_tables.table_name == tbl)
+    df_tables.loc[mask, "row_count"] = cnt
+
 # ── Header metrics ───────────────────────────────────────────────
 st.title("BigQuery — Current State")
 c1, c2, c3, c4 = st.columns(4)
@@ -489,6 +466,26 @@ with tab_by_dataset:
                 hide_index=True,
             )
 
+            # Per-view "Count Rows" buttons
+            views_in_ds = ds_tables[ds_tables.table_type == "VIEW"]
+            if not views_in_ds.empty:
+                st.caption("Fetch row counts for views:")
+                for _, v in views_in_ds.iterrows():
+                    vkey = (v["dataset_id"], v["table_name"])
+                    btn_key = f"count_ds_{v['dataset_id']}_{v['table_name']}"
+                    c_name, c_count, c_btn = st.columns([4, 2, 1])
+                    c_name.code(v["table_name"])
+                    if vkey in st.session_state["view_row_counts"]:
+                        c_count.metric("Rows", f"{st.session_state['view_row_counts'][vkey]:,}")
+                    else:
+                        c_count.caption("—")
+                    if c_btn.button("Count", key=btn_key):
+                        with st.spinner(f"Counting {v['table_name']} …"):
+                            cnt = count_single_view_rows(client, project, v["dataset_id"], v["table_name"])
+                        if cnt is not None:
+                            st.session_state["view_row_counts"][vkey] = cnt
+                            st.rerun()
+
 # ── Tab 2: All objects in one filterable table ───────────────────
 with tab_all:
     fc1, fc2 = st.columns(2)
@@ -509,3 +506,25 @@ with tab_all:
         hide_index=True,
     )
     st.caption(f"Showing {len(filtered)} of {len(df_tables)} objects")
+
+    # Per-view "Count Rows" buttons
+    filtered_views = filtered[filtered.table_type == "VIEW"]
+    if not filtered_views.empty:
+        st.divider()
+        st.subheader("Fetch View Row Counts")
+        st.caption("Views don't have row counts in INFORMATION_SCHEMA. Click to query each view individually.")
+        for _, v in filtered_views.iterrows():
+            vkey = (v["dataset_id"], v["table_name"])
+            btn_key = f"count_all_{v['dataset_id']}_{v['table_name']}"
+            c_name, c_count, c_btn = st.columns([4, 2, 1])
+            c_name.code(f"{v['dataset_id']}.{v['table_name']}")
+            if vkey in st.session_state["view_row_counts"]:
+                c_count.metric("Rows", f"{st.session_state['view_row_counts'][vkey]:,}")
+            else:
+                c_count.caption("—")
+            if c_btn.button("Count", key=btn_key):
+                with st.spinner(f"Counting {v['dataset_id']}.{v['table_name']} …"):
+                    cnt = count_single_view_rows(client, project, v["dataset_id"], v["table_name"])
+                if cnt is not None:
+                    st.session_state["view_row_counts"][vkey] = cnt
+                    st.rerun()

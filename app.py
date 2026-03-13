@@ -168,6 +168,35 @@ def fetch_table_creators(project: str) -> pd.DataFrame:
         return pd.DataFrame(columns=["dataset_id", "table_name", "created_by"])
 
 
+def fetch_jobs(client: bigquery.Client, region: str, days: int = 30) -> pd.DataFrame:
+    """Fetch job history from INFORMATION_SCHEMA.JOBS_BY_PROJECT."""
+    log.info("Fetching jobs from INFORMATION_SCHEMA.JOBS_BY_PROJECT …")
+    t0 = time.time()
+    sql = f"""
+    SELECT
+        job_id,
+        user_email,
+        job_type,
+        statement_type,
+        creation_time,
+        end_time,
+        state,
+        destination_table.project_id  AS dest_project,
+        destination_table.dataset_id  AS dest_dataset,
+        destination_table.table_id    AS dest_table,
+        total_bytes_processed,
+        total_bytes_billed,
+        query
+    FROM `region-{region}.INFORMATION_SCHEMA.JOBS_BY_PROJECT`
+    WHERE creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {days} DAY)
+      AND job_type IS NOT NULL
+    ORDER BY creation_time DESC
+    """
+    df = client.query(sql).to_dataframe()
+    log.info("Fetched %d jobs in %.1fs", len(df), time.time() - t0)
+    return df
+
+
 def fetch_tables(client: bigquery.Client, region: str) -> pd.DataFrame:
     log.info("Fetching tables/views from INFORMATION_SCHEMA.TABLES …")
     t0 = time.time()
@@ -439,7 +468,7 @@ c4.metric("Total Size", fmt_size(total_bytes if not pd.isna(total_bytes) else 0)
 
 st.divider()
 
-tab_by_dataset, tab_all = st.tabs(["By Dataset", "All Objects"])
+tab_by_dataset, tab_all, tab_jobs = st.tabs(["By Dataset", "All Objects", "Job History"])
 
 # ── Tab 1: Per-dataset sections ──────────────────────────────────
 with tab_by_dataset:
@@ -528,3 +557,68 @@ with tab_all:
                 if cnt is not None:
                     st.session_state["view_row_counts"][vkey] = cnt
                     st.rerun()
+
+# ── Tab 3: Job History ────────────────────────────────────────────
+with tab_jobs:
+    st.subheader("Job History")
+    st.caption("Query jobs from `INFORMATION_SCHEMA.JOBS_BY_PROJECT`. Use filters to find what query wrote to a specific table.")
+
+    jc1, jc2, jc3, jc4 = st.columns(4)
+    days_back = jc1.number_input("Look back (days)", min_value=1, max_value=180, value=30, step=1)
+    job_type_filter = jc2.selectbox("Job type", ["All", "QUERY", "LOAD", "COPY", "EXTRACT"], key="job_type")
+    dest_dataset_filter = jc3.text_input("Destination dataset", placeholder="e.g. hubspot_mart", key="dest_ds")
+    dest_table_filter = jc4.text_input("Destination table", placeholder="e.g. contact_summary", key="dest_tbl")
+
+    fetch_jobs_btn = st.button("Fetch Jobs", type="primary")
+
+    if fetch_jobs_btn:
+        with st.spinner("Fetching job history …"):
+            st.session_state["df_jobs"] = fetch_jobs(client, region, days=int(days_back))
+
+    if "df_jobs" in st.session_state:
+        df_jobs = st.session_state["df_jobs"]
+
+        # Apply filters
+        if job_type_filter != "All":
+            df_jobs = df_jobs[df_jobs.job_type == job_type_filter]
+        if dest_dataset_filter:
+            df_jobs = df_jobs[df_jobs.dest_dataset.str.contains(dest_dataset_filter, case=False, na=False)]
+        if dest_table_filter:
+            df_jobs = df_jobs[df_jobs.dest_table.str.contains(dest_table_filter, case=False, na=False)]
+
+        st.metric("Matching jobs", len(df_jobs))
+
+        if df_jobs.empty:
+            st.info("No jobs match the current filters.")
+        else:
+            # Summary table
+            display_jobs = df_jobs[[
+                "creation_time", "user_email", "job_type", "statement_type",
+                "dest_dataset", "dest_table", "state", "total_bytes_processed",
+            ]].copy()
+            display_jobs["total_bytes_processed"] = display_jobs["total_bytes_processed"].apply(fmt_size)
+            display_jobs = display_jobs.rename(columns={
+                "creation_time": "Time",
+                "user_email": "User",
+                "job_type": "Job Type",
+                "statement_type": "Statement",
+                "dest_dataset": "Dest Dataset",
+                "dest_table": "Dest Table",
+                "state": "State",
+                "total_bytes_processed": "Bytes Processed",
+            })
+            st.dataframe(display_jobs, use_container_width=True, hide_index=True)
+
+            # Expandable query details
+            st.divider()
+            st.subheader("Query Details")
+            st.caption("Click a job to see the full SQL query.")
+            for idx, job in df_jobs.head(50).iterrows():
+                dest_label = f"{job['dest_dataset']}.{job['dest_table']}" if pd.notna(job['dest_dataset']) else "—"
+                time_label = fmt_ts(job["creation_time"])
+                stmt = job["statement_type"] if pd.notna(job["statement_type"]) else job["job_type"]
+                with st.expander(f"{time_label} | {stmt} → {dest_label} | {job['user_email']}"):
+                    if pd.notna(job["query"]):
+                        st.code(job["query"], language="sql")
+                    else:
+                        st.caption("No query text available (non-query job).")
